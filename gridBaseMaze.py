@@ -1,10 +1,14 @@
 import random
+import matplotlib
+matplotlib.use('Agg')  # Headless backend
 import matplotlib.pyplot as plt
-import numpy as np
+import plotly.graph_objects as go
+from mpl_toolkits.mplot3d import Axes3D
+from ortools.sat.python import cp_model
 
 # --- Cell3D Class ---
 class Cell3D:
-    def __init__(self, x, y, z=0):
+    def __init__(self, x, y, z=None):
         self.x = x
         self.y = y
         self.z = z
@@ -18,10 +22,6 @@ class Cell3D:
 
     def is_linked(self, other):
         return other in self.links
-
-    def __repr__(self):
-        return f"Cell({self.x}, {self.y}, {self.z})"
-
 
 # --- Grid3D Class ---
 class Grid3D:
@@ -50,17 +50,12 @@ class Grid3D:
                         cell.neighbors.append(self.grid[z][y - 1][x])
                     if y < self.height - 1:
                         cell.neighbors.append(self.grid[z][y + 1][x])
-                    if z > 0:
-                        cell.neighbors.append(self.grid[z - 1][y][x])
-                    if z < self.depth - 1:
-                        cell.neighbors.append(self.grid[z + 1][y][x])
 
     def each_cell(self):
         for z_layer in self.grid:
             for row in z_layer:
                 for cell in row:
                     yield cell
-
 
 # --- Union-Find Class ---
 class UnionFind:
@@ -80,78 +75,188 @@ class UnionFind:
             return True
         return False
 
-
-# --- Kruskal with Cycle Detection ---
-def kruskal_with_cycle_tracking(grid, z=0):
+# --- Kruskal Maze Generation ---
+def kruskal_with_cycle_tracking(grid):
     uf = UnionFind()
     edges = []
 
     for cell in grid.each_cell():
-        if cell.z != z:
-            continue
         for neighbor in cell.neighbors:
-            if neighbor.z == z and cell.x <= neighbor.x and cell.y <= neighbor.y:
+            if (cell.x, cell.y) <= (neighbor.x, neighbor.y):
                 edges.append((cell, neighbor))
 
     random.shuffle(edges)
-    cycle_links = []
-
-    print("\n--- Running Kruskal's Algorithm ---")
 
     for a, b in edges:
         if uf.union(a, b):
             a.link(b)
-        else:
-            print(f"Cycle detected: ({a.x},{a.y}) <-> ({b.x},{b.y})")
-            a.link(b)
-            cycle_links.append((a, b))
 
-    return cycle_links
+# --- Assign Z-Values with Constraints ---
+def assign_z_values(grid, threshold=1, max_z=10):
+    model = cp_model.CpModel()
+    z_vars = {}
+    max_height = max_z
 
+    for cell in grid.each_cell():
+        cell.z = None
+        z_vars[cell] = model.NewIntVar(0, max_height, f"z_{cell.x}_{cell.y}_{cell.z}")
 
-# --- Draw Maze Evolution ---
-def draw_maze_evolution(grid, z, cycle_steps):
-    total_steps = len(cycle_steps) + 1
-    cols = min(5, total_steps)
-    rows = (total_steps + cols - 1) // cols
-
-    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
-    axes = np.array(axes).reshape(-1)
-
-    def draw_grid_state(ax, title=""):
-        for cell in grid.each_cell():
-            if cell.z != z:
+    already_checked = set()
+    for cell in grid.each_cell():
+        for neighbor in cell.neighbors:
+            if (cell, neighbor) in already_checked or (neighbor, cell) in already_checked:
                 continue
-            x = cell.x
-            y = grid.height - cell.y - 1
-            for linked in cell.links:
-                if linked.z != z:
-                    continue
-                x2 = linked.x
-                y2 = grid.height - linked.y - 1
-                ax.plot([x + 0.5, x2 + 0.5], [y + 0.5, y2 + 0.5], color='black', linewidth=1)
-            ax.plot(x + 0.5, y + 0.5, 'o', color='gray', markersize=3)
-            ax.text(x + 0.5, y + 0.5, f"({x},{y})", ha='center', va='center', fontsize=6, color='blue')
-        ax.set_xlim(0, grid.width)
-        ax.set_ylim(0, grid.height)
-        ax.set_title(title)
-        ax.axis('off')
+            already_checked.add((cell, neighbor))
 
-    draw_grid_state(axes[0], "Original (with cycles)")
+            diff = model.NewIntVar(-max_height, max_height, f"diff_{cell.x}_{cell.y}_{cell.z}_{neighbor.x}_{neighbor.y}_{neighbor.z}")
+            abs_diff = model.NewIntVar(0, max_height, f"absdiff_{cell.x}_{cell.y}_{cell.z}_{neighbor.x}_{neighbor.y}_{neighbor.z}")
+            model.Add(diff == z_vars[cell] - z_vars[neighbor])
+            model.AddAbsEquality(abs_diff, diff)
 
-    for i, (a, b) in enumerate(cycle_steps):
-        a.links.discard(b)
-        b.links.discard(a)
-        draw_grid_state(axes[i + 1], f"Removed ({a.x},{a.y}) <-> ({b.x},{b.y})")
+            if cell.is_linked(neighbor):
+                model.Add(abs_diff <= threshold)
+            else:
+                model.Add(abs_diff > threshold)
 
-    for i in range(total_steps, len(axes)):
-        axes[i].axis('off')
+    model.Minimize(sum(z_vars[c] for c in z_vars))
 
+    solver = cp_model.CpSolver()
+    status = solver.Solve(model)
+
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        for cell in z_vars:
+            cell.z = solver.Value(z_vars[cell])
+            print(f" Cell ({cell.x}, {cell.y}) assigned z = {cell.z}")
+    else:
+        print(" No feasible solution found.")
+
+# --- Draw 3D Maze ---
+def draw_3d_maze(grid, filename="3d_maze_with_assigned_z.png"):
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.set_title("3D Maze")
+
+    for cell in grid.each_cell():
+        x, y, z = cell.x, cell.y, cell.z
+        for neighbor in cell.links:
+            x2, y2, z2 = neighbor.x, neighbor.y, neighbor.z
+            ax.plot([x + 0.5, x2 + 0.5], [y + 0.5, y2 + 0.5], [z + 0.5, z2 + 0.5], color='black')
+        ax.scatter(x + 0.5, y + 0.5, z + 0.5, color='blue', s=10)
+
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.set_xlim(0, grid.width)
+    ax.set_ylim(0, grid.height)
+    ax.set_zlim(0, max(cell.z for cell in grid.each_cell()) + 1)
     plt.tight_layout()
-    plt.show()
+    plt.savefig(filename)
+    print(f" 3D maze image saved as '{filename}'")
 
+# --- Link Matrix ---
+def link_matrix(grid):
+    matrix = []
+    for y in range(grid.height):
+        row = []
+        for x in range(grid.width):
+            cell = grid.grid[0][y][x]
+            if x < grid.width - 1:
+                right = grid.grid[0][y][x + 1]
+                row.append(1 if cell.is_linked(right) else 0)
+            else:
+                row.append(-1)
+        matrix.append(row)
 
-# --- Main Program ---
-grid = Grid3D(width=5, height=5, depth=1)
-cycle_links = kruskal_with_cycle_tracking(grid, z=0)
-draw_maze_evolution(grid, z=0, cycle_steps=cycle_links)
+    bottom_links = []
+    for y in range(grid.height):
+        row = []
+        for x in range(grid.width):
+            cell = grid.grid[0][y][x]
+            if y < grid.height - 1:
+                below = grid.grid[0][y + 1][x]
+                row.append(1 if cell.is_linked(below) else 0)
+            else:
+                row.append(-1)
+        bottom_links.append(row)
+
+    return matrix, bottom_links
+
+# --- Plot Link Matrix ---
+def plot_link_matrix(grid):
+    horiz, vert = link_matrix(grid)
+    width = grid.width
+    height = grid.height
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.set_title("Maze Link Matrix")
+    ax.set_xlim(0, width)
+    ax.set_ylim(0, height)
+    ax.set_aspect('equal')
+    ax.invert_yaxis()
+
+    for y in range(height):
+        for x in range(width):
+            ax.plot(x + 0.5, y + 0.5, 'ko', markersize=5)
+            if x < width - 1 and horiz[y][x] == 1:
+                ax.plot([x + 0.5, x + 1.5], [y + 0.5, y + 0.5], 'b-', linewidth=2)
+            if y < height - 1 and vert[y][x] == 1:
+                ax.plot([x + 0.5, x + 0.5], [y + 0.5, y + 1.5], 'r-', linewidth=2)
+
+    ax.set_xticks(range(width + 1))
+    ax.set_yticks(range(height + 1))
+    ax.grid(True, which='both')
+    plt.tight_layout()
+    plt.savefig("link_matrix_plot.png")
+    print(" Link matrix visualization saved as 'link_matrix_plot.png'")
+
+def plot_z_values_as_bars(grid):
+    bar_data = []
+    link_data = []
+
+    for cell in grid.each_cell():
+        x1, y1, z1 = cell.x + 0.5, cell.y + 0.5, cell.z if cell.z is not None else 0
+
+        # Bar from base to Z
+        bar_data.append(go.Scatter3d(
+            x=[x1, x1],
+            y=[y1, y1],
+            z=[0, z1],
+            mode="lines",
+            line=dict(color='blue', width=8),
+            showlegend=False
+        ))
+
+        # Add link lines to neighbors
+        for neighbor in cell.links:
+            x2, y2, z2 = neighbor.x + 0.5, neighbor.y + 0.5, neighbor.z if neighbor.z is not None else 0
+            # Avoid double-drawing links
+            if (neighbor.x > cell.x) or (neighbor.y > cell.y):
+                link_data.append(go.Scatter3d(
+                    x=[x1, x2],
+                    y=[y1, y2],
+                    z=[z1, z2],
+                    mode="lines",
+                    line=dict(color='black', width=3),
+                    showlegend=False
+                ))
+
+    # Combine bar and link data
+    fig = go.Figure(data=bar_data + link_data)
+
+    fig.update_layout(
+        title="3D Maze with Elevation and Links (Interactive)",
+        scene=dict(
+            xaxis_title="X",
+            yaxis_title="Y",
+            zaxis_title="Z (Height)",
+            xaxis=dict(nticks=grid.width),
+            yaxis=dict(nticks=grid.height),
+            zaxis=dict(nticks=10),
+        ),
+        margin=dict(l=10, r=10, b=10, t=40),
+        showlegend=False
+    )
+
+    fig.write_html("z_bar_plot_with_links.html")
+    print("✅ Interactive plot with links saved as 'z_bar_plot_with_links.html'")
+    fig.show()
